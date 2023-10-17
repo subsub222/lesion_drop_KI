@@ -1,0 +1,13 @@
+class Hook():
+    def __init__(self, module, backward=False):
+        if backward == False:
+            self.hook = module.register_forward_hook(self.hook_fn)
+        else:
+            self.hook = module.register_full_backward_hook(self.hook_fn)
+
+    def hook_fn(self, module, input, output):
+        self.input = input
+        self.output = output
+
+    def closs(self):
+        self.hook.remove()

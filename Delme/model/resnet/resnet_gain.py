@@ -1,0 +1,262 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import os
+import numpy as np
+import cv2
+from models.resnet.layers import Hook
+
+
+class basicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(basicBlock, self).__init__()
+        expanded_out = out_channels * basicBlock.expansion
+        #
+        self.residual_function = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, expanded_out, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(expanded_out)
+        )
+        # projection mapping using 1x1conv
+        if stride != 1 or in_channels != expanded_out:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, expanded_out, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(expanded_out)
+            )
+        else:
+            self.shortcut = nn.Sequential()
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        x = self.residual_function(x) + self.shortcut(x)
+        x = self.act(x)
+        return x
+
+
+class BottleNeck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(BottleNeck, self).__init__()
+        expanded_out = out_channels * BottleNeck.expansion
+        #
+        self.residual_function = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, expanded_out, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(expanded_out),
+        )
+
+        if stride != 1 or in_channels != expanded_out:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, expanded_out, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(expanded_out)
+            )
+        else:
+            self.shortcut = nn.Sequential()
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        x = self.residual_function(x) + self.shortcut(x)
+        x = self.act(x)
+        return x
+
+
+class resnet(nn.Module):
+    def __init__(self, cfg, net_name='resnet6', num_classes=5):
+        super(resnet, self).__init__()
+        self.input_channel = cfg.inchannel
+        self.inplanes = 64
+        self.cfg = cfg
+        #
+        ch_per_block = [self.inplanes, 128, 256, 512]
+        if net_name == 'resnet4':
+            block = basicBlock
+            num_block = [1, 0, 0, 0]
+            fc_in = ch_per_block[0] * block.expansion
+            self.layer_gradcam = 'conv2_x'
+        elif net_name == 'resnet6':
+            block = basicBlock
+            num_block = [1, 1, 0, 0]
+            fc_in = ch_per_block[1] * block.expansion
+            self.layer_gradcam = 'conv3_x'
+        elif net_name == 'resnet10':
+            block = basicBlock
+            num_block = [1, 1, 1, 1]
+            fc_in = ch_per_block[3] * block.expansion
+            self.layer_gradcam = 'conv3_x'
+        elif net_name == 'resnet18':
+            block = basicBlock
+            num_block = [2, 2, 2, 2]
+            fc_in = ch_per_block[3] * block.expansion
+            self.layer_gradcam = 'conv5_x'
+        elif net_name == 'resnet24':
+            block = basicBlock
+            num_block = [2, 2, 3, 3]
+            fc_in = ch_per_block[3] * block.expansion
+            self.layer_gradcam = 'conv5_x'
+        elif net_name == 'resnet34':
+            block = basicBlock
+            num_block = [3, 4, 6, 3]
+            fc_in = ch_per_block[3] * block.expansion
+            self.layer_gradcam = 'conv5_x'
+        elif net_name == 'resnet50':
+            block = BottleNeck
+            num_block = [3, 4, 6, 3]
+            fc_in = ch_per_block[3] * block.expansion
+            self.layer_gradcam = 'conv5_x'
+        else:
+            raise NotImplementedError('Invalide net_name!!!:{}'.format(net_name))
+        #
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(self.input_channel, self.inplanes, kernel_size=3, stride=2, padding=0, bias=False),
+            nn.BatchNorm2d(self.inplanes),
+            nn.SiLU(),
+            nn.AdaptiveMaxPool2d((512, 512)),
+        )
+        pool_layer_avg = nn.AvgPool2d(2, 2)
+        pool_layer_max = nn.MaxPool2d(2, 2)
+        self.conv2_x = nn.Sequential(
+            self._make_layer(block, self.inplanes, num_block[0], 1) if num_block[0] != 0 else nn.Sequential(),
+        )
+        self.conv3_x = nn.Sequential(
+            self._make_layer(block, 128, num_block[1], 2) if num_block[1] != 0 else nn.Sequential(),
+        )
+        self.conv4_x = nn.Sequential(
+            self._make_layer(block, 256, num_block[2], 2) if num_block[2] != 0 else nn.Sequential(),
+            # pool_layer_max
+        )
+        self.conv5_x = nn.Sequential(
+            self._make_layer(block, 512, num_block[3], 1) if num_block[3] != 0 else nn.Sequential(),
+        )
+
+        self.avg_pool = nn.AdaptiveMaxPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(fc_in, num_classes)
+        #
+        self.hookF = [Hook(layer[1]) for layer in list(self._modules.items())]
+        self.hookB = [Hook(layer[1], backward=True) for layer in list(self._modules.items())]
+        #
+        self.am_factor = 1.0
+        self.mask_thres = 0.3
+
+    def _forward_cl(self, x):
+        out = self.conv1(x)
+        out = self.conv2_x(out)
+        out = self.conv3_x(out)
+        out = self.conv4_x(out)
+        out = self.conv5_x(out)
+        out = self.avg_pool(out)
+        out = self.flatten(out)
+        out = self.fc(out)
+        return out
+
+    def forward(self, input, label, gain=False):
+        # Classification
+        out_cl = self._forward_cl(input)
+        if gain:
+            # Get Attention Map (Ac)
+            self.gcam = self._forward_attention_map(out_cl, label, input.shape)
+            # Equation (5)
+            with torch.no_grad():
+                # make masked input
+                self.maskedimg = self._make_masked_input(input, self.gcam)
+                #
+                output_am = self._forward_cl(self.maskedimg)
+                output_am_score_softmax = F.softmax(output_am, dim=1)
+                # Get loss_am
+                loss_am = 0
+                loss_cnt = 0
+                for batch_idx in range(label.shape[0]):
+                    temp_label = label[batch_idx]
+                    if self.cfg.mode == 'cls':
+                        for id in range(len(temp_label)-1):
+                            if label[batch_idx, id+1] == 1:
+                                loss_cnt += 1
+                                loss_am += output_am_score_softmax[batch_idx, id+1]
+                    elif self.cfg.mode == 'tiscls':
+                        for id in range(len(temp_label)):
+                            if label[batch_idx, id] == 1:
+                                loss_cnt += 1
+                                loss_am += output_am_score_softmax[batch_idx, id]
+                self.loss_am = loss_am / loss_cnt * self.am_factor if loss_cnt !=0 else 0
+        return out_cl
+
+    def _forward_attention_map(self, out_cl, label, input_size):
+        layer_index = np.argmax(
+            np.array([name == self.layer_gradcam for name in self._modules.keys()], dtype=np.int_))
+        #
+        label_wo_normal = torch.zeros_like(label)
+        label_wo_normal[:, 1:] = label[:, 1:]
+        score = out_cl * label_wo_normal
+        score.backward(torch.ones_like(score), retain_graph=True)
+        # Equation (1)
+        gradient = self.hookB[layer_index].output[0]
+        w_c = gradient.sum(dim=2, keepdim=True).sum(dim=3, keepdim=True) / (gradient.shape[2] * gradient.shape[3])
+        # Equation (2)
+        feature_maps = self.hookF[layer_index].output
+        gcam = F.relu((feature_maps.detach() * w_c.detach()).sum(dim=1).unsqueeze(dim=1))
+        gcam = F.interpolate(gcam, size=(input_size[2], input_size[3]))
+        #
+        return gcam
+
+    def _make_masked_input(self, input, Ac):
+        scaled_Ac = (Ac - Ac.min()) / (Ac.max() - Ac.min())
+        mask = torch.zeros_like(scaled_Ac)
+        mask[scaled_Ac > self.mask_thres] = 1
+        mask[scaled_Ac <= self.mask_thres] = 0
+        maskedImg = input * (1 - mask)
+        return maskedImg
+
+    def _make_layer(self, block, out_channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.inplanes, out_channels, stride))
+            self.inplanes = out_channels * block.expansion
+        return nn.Sequential(*layers)
+
+    def get_gcam(self):
+        return self.gcam
+
+    @staticmethod
+    def predict(out):
+        y = F.softmax(out, dim=1)
+        return y
+
+    def get_loss_am(self):
+        return self.loss_am
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 1)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+
+if __name__ == '__main__':
+    print('Debug StackedAE')
+    model = resnet('resnet152')
+    model.init_weights()
+    x = torch.rand(1, 3, 52, 52)
+    model.set_input(x)
+    model.forward()
+    output_1 = model.get_outputs()
+    output = model.get_output()
+    print(output.shape)
+    print('Debug StackedAE')
